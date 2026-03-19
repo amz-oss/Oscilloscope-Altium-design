@@ -1,0 +1,234 @@
+// ===== Pin Definitions =====
+#define SCLK 18
+#define CS   5
+
+#define SDATA_A 23
+#define SDATA_B 19
+
+// ===== Sampling =====
+#define NUM_SAMPLES 500
+
+// ===== ADC / Debug Scaling =====
+const float ADC_REF_V = 2.048f;
+const float DIVIDER_GAIN = 10.0f;
+
+// ===== Channel Mapping =====
+#define SWAP_CHANNELS 1
+
+// ===== Reconstruction Tuning =====
+#define SMOOTH_WINDOW 5
+#define MAX_PEAKS 12
+
+// ===== Amplitude Calibration =====
+const float RECON_GAIN = 4.75f;
+
+// Optional safety clamp
+const float MAX_EST_PEAK_V = 5.0f;
+const float MIN_EST_PEAK_V = 0.05f;
+
+uint16_t samplesA[NUM_SAMPLES];
+uint16_t samplesB[NUM_SAMPLES];
+
+float ch2Measured[NUM_SAMPLES];
+float ch2Smooth[NUM_SAMPLES];
+float ch2Recon[NUM_SAMPLES];
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SCLK, OUTPUT);
+  pinMode(CS, OUTPUT);
+  pinMode(SDATA_A, INPUT);
+  pinMode(SDATA_B, INPUT);
+
+  digitalWrite(CS, HIGH);
+  digitalWrite(SCLK, LOW);
+}
+
+void readADC(uint16_t &chA, uint16_t &chB) {
+  uint16_t rawA = 0;
+  uint16_t rawB = 0;
+
+  digitalWrite(CS, LOW);
+
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(SCLK, HIGH);
+    delayMicroseconds(1);
+
+    rawA = (rawA << 1) | digitalRead(SDATA_A);
+    rawB = (rawB << 1) | digitalRead(SDATA_B);
+
+    digitalWrite(SCLK, LOW);
+    delayMicroseconds(1);
+  }
+
+  digitalWrite(CS, HIGH);
+
+  chA = (rawA >> 2) & 0x0FFF;
+  chB = (rawB >> 2) & 0x0FFF;
+
+#if SWAP_CHANNELS
+  uint16_t tmp = chA;
+  chA = chB;
+  chB = tmp;
+#endif
+}
+
+// Temporary debug conversion only
+float codeToApproxInputVolts(uint16_t code) {
+  float v_adc = (code / 4095.0f) * ADC_REF_V;
+  return v_adc * DIVIDER_GAIN;
+}
+
+void smoothSignal(float *in, float *out, int n, int window) {
+  int half = window / 2;
+
+  for (int i = 0; i < n; i++) {
+    float sum = 0.0f;
+    int count = 0;
+
+    for (int k = -half; k <= half; k++) {
+      int j = i + k;
+      if (j >= 0 && j < n) {
+        sum += in[j];
+        count++;
+      }
+    }
+
+    out[i] = sum / count;
+  }
+}
+
+float estimatePeak(float *x, int n) {
+  float maxVal = x[0];
+  for (int i = 1; i < n; i++) {
+    if (x[i] > maxVal) maxVal = x[i];
+  }
+  return maxVal;
+}
+
+float estimateMin(float *x, int n) {
+  float minVal = x[0];
+  for (int i = 1; i < n; i++) {
+    if (x[i] < minVal) minVal = x[i];
+  }
+  return minVal;
+}
+
+int findPeaks(float *x, int n, int *peakIdx, int maxPeaks, float threshold) {
+  int count = 0;
+
+  for (int i = 1; i < n - 1; i++) {
+    if (x[i] > x[i - 1] && x[i] >= x[i + 1] && x[i] > threshold) {
+      if (count < maxPeaks) {
+        peakIdx[count++] = i;
+      }
+      i += 2;
+    }
+  }
+
+  return count;
+}
+
+float estimatePeriodSamples(int *peakIdx, int numPeaks) {
+  if (numPeaks < 2) return -1.0f;
+
+  float sum = 0.0f;
+  for (int i = 0; i < numPeaks - 1; i++) {
+    sum += (peakIdx[i + 1] - peakIdx[i]);
+  }
+
+  return sum / (numPeaks - 1);
+}
+
+void reconstructSine(float *out, int n, float offset, float amplitude, float periodSamples, int firstPeakIndex) {
+  float omega = TWO_PI / periodSamples;
+  float phase = HALF_PI - omega * firstPeakIndex;
+
+  for (int i = 0; i < n; i++) {
+    out[i] = offset + amplitude * sinf(omega * i + phase);
+  }
+}
+
+void loop() {
+  // ===== Capture block and time it =====
+  unsigned long tStart = micros();
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    readADC(samplesA[i], samplesB[i]);
+  }
+
+  unsigned long tEnd = micros();
+  unsigned long captureTimeUs = tEnd - tStart;
+
+  // ===== Convert CH2 to approximate volts =====
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    ch2Measured[i] = codeToApproxInputVolts(samplesB[i]);
+  }
+
+  // ===== Smooth CH2 =====
+  smoothSignal(ch2Measured, ch2Smooth, NUM_SAMPLES, SMOOTH_WINDOW);
+
+  // ===== Estimate amplitude =====
+  float peak = estimatePeak(ch2Smooth, NUM_SAMPLES);
+  float minVal = estimateMin(ch2Smooth, NUM_SAMPLES);
+
+  float estAmplitude = (peak - minVal) * RECON_GAIN;
+  if (estAmplitude > MAX_EST_PEAK_V) estAmplitude = MAX_EST_PEAK_V;
+  if (estAmplitude < MIN_EST_PEAK_V) estAmplitude = MIN_EST_PEAK_V;
+
+  // ===== Find peaks =====
+  float threshold = minVal + 0.7f * (peak - minVal);
+
+  int peakIdx[MAX_PEAKS];
+  int numPeaks = findPeaks(ch2Smooth, NUM_SAMPLES, peakIdx, MAX_PEAKS, threshold);
+
+  float periodSamples;
+  int firstPeak;
+
+  if (numPeaks >= 1) {
+    periodSamples = estimatePeriodSamples(peakIdx, numPeaks);
+    firstPeak = peakIdx[0];
+  } else {
+    periodSamples = 12.0f;
+    firstPeak = 3;
+  }
+
+  // ===== Reconstruct predicted sine =====
+  reconstructSine(ch2Recon, NUM_SAMPLES, 0.0f, estAmplitude, periodSamples, firstPeak);
+
+  // ===== Frequency estimate =====
+  float sampleRateHz = 0.0f;
+  float freqHz = 0.0f;
+
+  if (captureTimeUs > 0) {
+    sampleRateHz = (1000000.0f * NUM_SAMPLES) / captureTimeUs;
+  }
+
+  if (periodSamples > 0.0f) {
+    freqHz = sampleRateHz / periodSamples;
+  }
+
+  // ===== Plot output =====
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    Serial.print(ch2Measured[i], 4);
+    Serial.print(",");
+    Serial.print(ch2Smooth[i], 4);
+    Serial.print(",");
+    Serial.println(ch2Recon[i], 4);
+  }
+
+  // ===== Frequency report =====
+  Serial.println();
+  Serial.print("Capture time (us): ");
+  Serial.println(captureTimeUs);
+  Serial.print("Estimated sample rate (Hz): ");
+  Serial.println(sampleRateHz, 2);
+  Serial.print("Estimated period (samples): ");
+  Serial.println(periodSamples, 2);
+  Serial.print("Estimated frequency (Hz): ");
+  Serial.println(freqHz, 2);
+  Serial.println();
+
+  delay(1000);
+}
